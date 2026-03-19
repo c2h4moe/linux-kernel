@@ -100,6 +100,8 @@ config CXL_MEM
 
 	  If unsure say 'm'.
 
+source "drivers/cxl/pool/Kconfig"
+
 config CXL_PORT
 	default CXL_BUS
 	tristate

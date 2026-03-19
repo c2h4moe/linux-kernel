@@ -254,9 +254,69 @@ err:
 	return rc;
 }
 
+// int cxl_alloc_pfn_from_bitmap(unsigned long *pfn_out)
+// {
+//     struct cxl_region *r = cxl_get_default_region(); /* 你需实现/已有 */
+//     unsigned long idx;
+//     unsigned long nr = r->nr_blocks;
+//     unsigned long reserved_blocks = DIV_ROUND_UP(r->bitmap_reserve, r->block_size);
+
+//     /* 1) 获取跨主机/跨 CPU 的内存锁 - 存在于 CXL 内存 header */
+//     while (atomic64_cmpxchg((atomic64_t *)r->lock_addr, 0, 1) != 0)
+//         cpu_relax();
+
+//     /* 2) 查找第一个 0 位 */
+//     idx = find_first_zero_bit(r->bitmap, nr);
+//     if (idx >= nr) {
+//         atomic64_set((atomic64_t *)r->lock_addr, 0);
+//         return -ENOMEM;
+//     }
+
+//     /* 3) 标记（占用）该位 */
+//     __set_bit(idx, r->bitmap);
+
+//     /* 4) 防止分配到 bitmap 占用区（bitmap_reserve 包含在已标位的 reserved_blocks） */
+//     if (idx < reserved_blocks) {
+//         /* 这是不大可能的（reserved_blocks 在初始化时设为已占用），
+//            但以防：回退并继续找下一个 */
+//         clear_bit(idx, r->bitmap);
+//         /* 简单处理：release lock, 返回 busy，让上级重试或返回 ENOMEM */
+//         atomic64_set((atomic64_t *)r->lock_addr, 0);
+//         return -EAGAIN;
+//     }
+
+//     /* 5) 计算 pfn 并返回 */
+//     *pfn_out = (r->res.start >> PAGE_SHIFT) + idx;
+
+//     /* 释放跨主机锁 */
+//     atomic64_set((atomic64_t *)r->lock_addr, 0);
+//     return 0;
+// }
+
+// void cxl_free_pfn_to_bitmap(unsigned long pfn)
+// {
+//     struct cxl_region *r = cxl_get_default_region();
+//     unsigned long idx = pfn - (r->res.start >> PAGE_SHIFT);
+
+//     if (idx >= r->nr_blocks)
+//         return;
+
+//     /* lock */
+//     while (atomic64_cmpxchg((atomic64_t *)r->lock_addr, 0, 1) != 0)
+//         cpu_relax();
+
+//     clear_bit(idx, r->bitmap);
+
+//     /* unlock */
+//     atomic64_set((atomic64_t *)r->lock_addr, 0);
+// }
+// EXPORT_SYMBOL_GPL(cxl_alloc_pfn_from_bitmap);
+// EXPORT_SYMBOL_GPL(cxl_free_pfn_to_bitmap);
+
 static ssize_t commit_store(struct device *dev, struct device_attribute *attr,
 			    const char *buf, size_t len)
 {
+	printk(KERN_DEBUG "commit_store\n");
 	struct cxl_region *cxlr = to_cxl_region(dev);
 	struct cxl_region_params *p = &cxlr->params;
 	bool commit;
@@ -289,6 +349,28 @@ static ssize_t commit_store(struct device *dev, struct device_attribute *attr,
 	rc = cxl_region_invalidate_memregion(cxlr);
 	if (rc)
 		goto out;
+	
+	resource_size_t size = resource_size(p->res);
+	printk(KERN_DEBUG "region size: %lld\n", (long long)size);
+    resource_size_t block_size = PAGE_SIZE;
+    unsigned long nr_blocks = size / block_size;
+	unsigned long bitmap_blocks = DIV_ROUND_UP(nr_blocks, PAGE_SIZE * 8);
+	printk(KERN_DEBUG "region blocks: %lu, bitmap blocks: %lu\n", nr_blocks, bitmap_blocks);
+
+	void* cxl_kaddr = memremap(p->res->start, (bitmap_blocks + 1) * PAGE_SIZE, MEMREMAP_WB);
+	if (!cxl_kaddr) {
+		printk(KERN_ERR "memremap failed\n");
+		rc = -ENOMEM;
+		goto out;
+	}
+	printk(KERN_DEBUG "cxl_kaddr: %p\n", cxl_kaddr);
+	void* bitmap_kaddr = (void*)((unsigned long long)cxl_kaddr + PAGE_SIZE);
+	bitmap_set((unsigned long*)cxl_kaddr, nr_blocks,
+	  bitmap_blocks * PAGE_SIZE * 8 - nr_blocks);
+	bitmap_clear((unsigned long*)bitmap_kaddr, 0, nr_blocks);
+	bitmap_set((unsigned long*)bitmap_kaddr, 0, bitmap_blocks + 1);
+
+		
 
 	if (commit) {
 		rc = cxl_region_decode_commit(cxlr);

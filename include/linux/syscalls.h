@@ -287,6 +287,7 @@ static inline int is_syscall_trace_event(struct trace_event_call *tp_event)
 #define SYSCALL32_DEFINE6 SYSCALL_DEFINE6
 #endif
 
+asmlinkage long sys_cxl_init(int num);
 /*
  * These syscall function prototypes are kept in the same order as
  * include/uapi/asm-generic/unistd.h. Architecture specific entries go below,
@@ -1183,6 +1184,7 @@ asmlinkage long sys_old_mmap(struct mmap_arg_struct __user *arg);
  * not implemented -- see kernel/sys_ni.c
  */
 asmlinkage long sys_ni_syscall(void);
+
 
 #endif /* CONFIG_ARCH_HAS_SYSCALL_WRAPPER */
 

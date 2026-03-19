@@ -1,0 +1,8 @@
+config CXL_POOL
+	tristate "CXL Memory Pool Allocator"
+	depends on CXL_MEM && DAX
+	help
+	  CXL memory pool allocator with free list management.
+	  This module provides a simple allocator for CXL memory that can
+	  be shared across multiple machines. Use machine_id=0 to initialize
+	  the pool, other IDs just join the existing pool.

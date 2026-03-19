@@ -77,6 +77,10 @@
 
 #include "uid16.h"
 
+#include <linux/types.h>
+#include <linux/dax.h>
+#include <linux/pfn.h>
+
 #ifndef SET_UNALIGN_CTL
 # define SET_UNALIGN_CTL(a, b)	(-EINVAL)
 #endif
@@ -2922,3 +2926,34 @@ COMPAT_SYSCALL_DEFINE1(sysinfo, struct compat_sysinfo __user *, info)
 	return 0;
 }
 #endif /* CONFIG_COMPAT */
+
+SYSCALL_DEFINE1(cxl_init, int, num)
+{
+	// printk(KERN_INFO "cxl_init syscall called with arg: %d\n", num);
+	// struct file* f = filp_open("/dev/dax0.0", O_RDWR, 0);
+	// if (IS_ERR(f)) {
+	// 	printk(KERN_ERR "filp_open error: %ld\n", PTR_ERR(f));
+    //     return PTR_ERR(f);
+    // }
+	// struct dev_dax *devdax = f->private_data;
+	// struct dax_device *dax_dev = devdax->dax_dev;
+	// printk(KERN_INFO "dax_dev: %p\n", dax_dev);
+	// pgoff_t pgoff = 0;
+    // long nr_pages;
+    // pfn_t pfn;
+	// void* kaddr = NULL;
+
+	// int id = dax_read_lock();
+	// printk(KERN_INFO "read_lock_id: %d\n", id);
+    // nr_pages = dax_direct_access(dax_dev, pgoff, LONG_MAX, DAX_ACCESS, &kaddr, &pfn);
+	// printk(KERN_INFO "nr_pages: %ld\n", nr_pages);
+    // if (nr_pages < 0) {
+    //     filp_close(f, NULL);
+	// 	dax_read_unlock(id);
+    //     return nr_pages;
+    // }
+
+	// printk(KERN_INFO "nr_pages: %ld, pfn: %lld, kaddr: %p\n", nr_pages, pfn.val, kaddr);
+	// dax_read_unlock(id);
+	return 0;
+}

@@ -1,0 +1,9 @@
+cxl_pool.c定义了一个内核模块，用于管理CXL共享内存。该模块将CXL内存抽象为/dev/cxl_pool，用户空间程序通过ioctl分配和释放CXL内存资源（使用例可见test/cxl_pool_test.c）。
+编译内核时需要配置以m模式编译cxl_pool模块，编译内核后可通过make modules_install安装模块。安装完成后，进入qemu环境进行测试。
+进入qemu后，首先运行指令
+cxl create-region -m -d decoder0.0 -w 1 mem0 -s 512Mte-namespace -m dax -r region0
+ndctl create-namespace -m dax -r region0
+然后加载cxl_pool模块，运行指令
+insmod /lib/modules/6.8.0+/kernel/drivers/cxl/pool/cxl_pool.ko.zst machine_id=0
+最后可以运行测试程序。
+runtime/目录下有用户空间下的运行时库，提供了线程扩展等接口，cxl_macro_demo.c是一个使用例，在qemu中可以正常运行，不过这块儿AI生成的代码我还没太看懂，不太敢确定测试是否有效
