@@ -15,12 +15,8 @@ typedef void *(*cxl_entry_fn_t)(void *arg);
 struct cxl_macro_cfg {
 	int machine_id;
 	int nr_machines;
-	int macro_id;
-	uint64_t membership_mask;
-
 	uint64_t window_base;
 	uint64_t window_size;
-
 	uint64_t control_alloc_id;
 	uint64_t control_size;
 };
@@ -28,8 +24,8 @@ struct cxl_macro_cfg {
 struct cxl_macro_runtime;
 
 int cxl_macro_control_create(int fd, int nr_machines, uint64_t window_base,
-			     uint64_t window_size, uint64_t timeout_ns,
-			     uint64_t *alloc_id_out, uint64_t *mapped_size_out,
+			     uint64_t window_size, uint64_t *alloc_id_out,
+			     uint64_t *mapped_size_out,
 			     struct cxl_control_plane **ctl_out);
 
 int cxl_macro_init(struct cxl_macro_runtime **rt_out,
@@ -46,14 +42,6 @@ int cxl_macro_free(struct cxl_macro_runtime *rt, void *ptr, int timeout_ms);
 int cxl_spawn_remote(struct cxl_macro_runtime *rt, int target_machine,
 		     uint32_t entry_id, uint64_t arg_u64,
 		     uint64_t *thread_id_out, int timeout_ms);
-
-int cxl_macro_set_ready(struct cxl_macro_runtime *rt);
-uint64_t cxl_macro_get_ready_mask(struct cxl_macro_runtime *rt);
-int cxl_macro_wait_ready(struct cxl_macro_runtime *rt, uint64_t target_mask,
-			 int timeout_ms);
-
-int cxl_macro_request_stop(struct cxl_macro_runtime *rt);
-int cxl_macro_wait_stop(struct cxl_macro_runtime *rt, int timeout_ms);
 
 struct cxl_control_plane *cxl_macro_ctl(struct cxl_macro_runtime *rt);
 

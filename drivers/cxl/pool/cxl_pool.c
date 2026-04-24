@@ -40,12 +40,7 @@
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Research");
 MODULE_DESCRIPTION("CXL Memory Pool Allocator");
-MODULE_VERSION("0.2");
-
-/* Module parameter: machine ID (0 = initialize pool, >0 = join pool) */
-static int machine_id = 0;
-module_param(machine_id, int, 0644);
-MODULE_PARM_DESC(machine_id, "Machine ID (0 = initialize pool, other = join)");
+MODULE_VERSION("0.3");
 
 /*
  * Metadata structure stored in first 4KB of the CXL memory.
@@ -320,14 +315,13 @@ static ssize_t cxl_pool_read(struct file *filp, char __user *buf, size_t count,
 		return 0;
 
 	len = snprintf(info, sizeof(info),
-		       "machine_id=%d\n"
 		       "initialized=%d\n"
 		       "total_size=%llu\n"
 		       "total_4mb_pages=%llu\n"
 		       "free_4mb_pages=%llu\n"
 		       "head_idx=%u\n"
 		       "base_phys=0x%llx\n",
-		       machine_id, dev->initialized, dev->meta->total_size,
+		       dev->initialized, dev->meta->total_size,
 		       dev->meta->total_pages_4mb, dev->meta->free_pages_4mb,
 		       cxl_head_idx(dev->meta->head_tagged),
 		       dev->meta->cxl_base_phys);
@@ -652,34 +646,17 @@ got_size:
 	pr_info("cxl_pool: Mapped CXL memory: phys=0x%llx size=%llu bytes\n",
 		(u64)phys_addr, mem_size);
 
-	if (machine_id == 0) {
-		if (dev->meta->magic != CXL_POOL_MAGIC_MEM ||
-		    dev->meta->version != CXL_POOL_META_VERSION) {
-			pr_info("cxl_pool: Initializing CXL memory pool...\n");
-			ret = cxl_init_free_list(dev);
-			if (ret)
-				return ret;
-		} else {
-			pr_info("cxl_pool: Pool already initialized, joining...\n");
-		}
-		dev->initialized = 1;
-		return 0;
-	}
-
 	if (dev->meta->magic != CXL_POOL_MAGIC_MEM ||
 	    dev->meta->version != CXL_POOL_META_VERSION) {
-		pr_err("cxl_pool: Pool not initialized with v%u metadata.\n",
-		       CXL_POOL_META_VERSION);
-		if (dev->used_ioremap)
-			iounmap(dev->kaddr);
-		else
-			memunmap(dev->kaddr);
-		dev->kaddr = NULL;
-		return -ENODEV;
+		pr_info("cxl_pool: Initializing CXL memory pool...\n");
+		ret = cxl_init_free_list(dev);
+		if (ret)
+			return ret;
+	} else {
+		pr_info("cxl_pool: Reusing existing pool: total=%llu free=%llu\n",
+			dev->meta->total_pages_4mb, dev->meta->free_pages_4mb);
 	}
 
-	pr_info("cxl_pool: Joining existing pool: total=%llu free=%llu\n",
-		dev->meta->total_pages_4mb, dev->meta->free_pages_4mb);
 	dev->initialized = 1;
 	return 0;
 }
@@ -704,7 +681,7 @@ static int __init cxl_pool_init(void)
 {
 	int ret;
 
-	pr_info("cxl_pool: Loading module, machine_id=%d\n", machine_id);
+	pr_info("cxl_pool: Loading module\n");
 
 	pool_dev = kzalloc(sizeof(*pool_dev), GFP_KERNEL);
 	if (!pool_dev)

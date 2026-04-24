@@ -5,7 +5,9 @@ This directory contains a user-space prototype for "macro-process" execution:
 - one process per simulated machine,
 - shared CXL virtual-address window across machines,
 - remote spawn by command queue in CXL shared memory,
-- strong mapping barrier for shared allocations.
+- strong mapping barrier for shared allocations,
+- one fixed macro-process,
+- no heartbeat, membership, or failure recovery logic.
 
 ## Build
 
@@ -19,7 +21,7 @@ make
 Load the kernel module first (example):
 
 ```bash
-insmod /path/to/cxl_pool.ko machine_id=0
+insmod /path/to/cxl_pool.ko
 ```
 
 Run demo with 2 simulated machines:

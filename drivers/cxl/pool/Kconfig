@@ -4,5 +4,5 @@ config CXL_POOL
 	help
 	  CXL memory pool allocator with free list management.
 	  This module provides a simple allocator for CXL memory that can
-	  be shared across multiple machines. Use machine_id=0 to initialize
-	  the pool, other IDs just join the existing pool.
+	  be shared by user-space runtimes. The module initializes the pool
+	  metadata on first load and reuses it on later loads.

@@ -4,6 +4,10 @@ cxl_pool.c定义了一个内核模块，用于管理CXL共享内存。该模块�
 cxl create-region -m -d decoder0.0 -w 1 mem0 -s 512Mte-namespace -m dax -r region0
 ndctl create-namespace -m dax -r region0
 然后加载cxl_pool模块，运行指令
-insmod /lib/modules/6.8.0+/kernel/drivers/cxl/pool/cxl_pool.ko.zst machine_id=0
+insmod /lib/modules/6.8.0+/kernel/drivers/cxl/pool/cxl_pool.ko.zst
 最后可以运行测试程序。
-runtime/目录下有用户空间下的运行时库，提供了线程扩展等接口，cxl_macro_demo.c是一个使用例，在qemu中可以正常运行，不过这块儿AI生成的代码我还没太看懂，不太敢确定测试是否有效
+runtime/目录下有一个精简版用户空间运行时原型：
+- 单个内核模块实例管理整个CXL pool
+- “多主机”由多个用户态进程模拟
+- 只支持一个宏进程
+- 不包含heartbeat、membership和容错逻辑

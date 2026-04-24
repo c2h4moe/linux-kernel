@@ -6,10 +6,11 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <linux/futex.h>
 #include <sched.h>
+#include <stdatomic.h>
 #include <stdbool.h>
-#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,6 +28,7 @@
 #define CXL_DEV_PATH "/dev/cxl_pool"
 #define CXL_MAX_ENTRIES 128
 
+/* Local record so free(ptr) can recover alloc_id and VA offset. */
 struct cxl_local_alloc {
 	void *addr;
 	uint64_t alloc_id;
@@ -35,31 +37,34 @@ struct cxl_local_alloc {
 	struct cxl_local_alloc *next;
 };
 
+/* entry_id -> local function pointer mapping for remote spawn. */
 struct cxl_entry {
 	uint32_t id;
 	cxl_entry_fn_t fn;
 	char name[48];
 };
 
+/* Small heap object passed into pthread_create() on the target machine. */
 struct cxl_spawn_ctx {
 	cxl_entry_fn_t fn;
 	uint64_t arg_u64;
 };
 
+/*
+ * One runtime instance corresponds to one simulated machine-process.
+ * ctl points to the shared CXL control-plane, while rx_thread consumes commands
+ * destined for this machine and applies MAP / UNMAP / SPAWN.
+ */
 struct cxl_macro_runtime {
 	int fd;
 	int machine_id;
 	int nr_machines;
-	int macro_id;
 	uint64_t machine_bit;
-	uint64_t membership_mask;
+	uint64_t all_mask;
 	uint64_t window_base;
 	uint64_t window_size;
-
-	uint64_t control_alloc_id;
 	uint64_t control_size;
 	struct cxl_control_plane *ctl;
-	void *window_token;
 
 	pthread_t rx_thread;
 	atomic_int local_stop;
@@ -81,7 +86,7 @@ static uint64_t cxl_now_ns(void)
 	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
-static int cxl_futex_wait(atomic_uint_fast32_t *uaddr, uint32_t val, int ms)
+static int cxl_futex_wait(_Atomic uint32_t *uaddr, uint32_t val, int ms)
 {
 	struct timespec ts;
 	struct timespec *tsp = NULL;
@@ -95,7 +100,7 @@ static int cxl_futex_wait(atomic_uint_fast32_t *uaddr, uint32_t val, int ms)
 	return syscall(SYS_futex, uaddr, FUTEX_WAIT, val, tsp, NULL, 0);
 }
 
-static int cxl_futex_wake(atomic_uint_fast32_t *uaddr, int n)
+static int cxl_futex_wake(_Atomic uint32_t *uaddr, int n)
 {
 	return syscall(SYS_futex, uaddr, FUTEX_WAKE, n, NULL, NULL, 0);
 }
@@ -110,11 +115,15 @@ static int cxl_set_barrier_status(struct cxl_barrier *b, int status)
 	return 0;
 }
 
+/*
+ * A barrier represents one distributed operation that needs acknowledgements
+ * from a set of machines, such as MAP_REQ, UNMAP_REQ or SPAWN_REQ.
+ */
 static int cxl_barrier_init(struct cxl_macro_runtime *rt, uint64_t cmd_id,
 			    uint64_t expected_mask, struct cxl_barrier **out)
 {
-	uint64_t start_ns = cxl_now_ns();
 	struct cxl_barrier *b;
+	uint64_t start_ns = cxl_now_ns();
 
 	b = &rt->ctl->barriers[cmd_id % CXL_MACRO_MAX_BARRIERS];
 	for (;;) {
@@ -145,22 +154,23 @@ static void cxl_barrier_fini(struct cxl_barrier *b)
 	atomic_store(&b->in_use, 0);
 }
 
+/* Mark one machine as having finished cmd_id. */
 static int cxl_barrier_ack(struct cxl_macro_runtime *rt, uint64_t cmd_id,
 			   uint64_t machine_bit, int status)
 {
 	struct cxl_barrier *b = &rt->ctl->barriers[cmd_id % CXL_MACRO_MAX_BARRIERS];
-	uint64_t cur_cmd = atomic_load(&b->cmd_id);
 
-	if (!atomic_load(&b->in_use) || cur_cmd != cmd_id)
+	if (!atomic_load(&b->in_use) || atomic_load(&b->cmd_id) != cmd_id)
 		return -ENOENT;
 
 	atomic_fetch_or(&b->ack_mask, machine_bit);
 	cxl_set_barrier_status(b, status);
 	atomic_fetch_add(&b->futex_word, 1);
-	cxl_futex_wake(&b->futex_word, INT32_MAX);
+	cxl_futex_wake(&b->futex_word, INT_MAX);
 	return 0;
 }
 
+/* Wait until every required machine ACKs or one reports an error. */
 static int cxl_barrier_wait(struct cxl_barrier *b, int timeout_ms)
 {
 	uint64_t start_ns = cxl_now_ns();
@@ -210,6 +220,10 @@ static int cxl_queue_push(struct cxl_machine_queue *q, const struct cxl_cmd *cmd
 	return 0;
 }
 
+/*
+ * Each machine owns one inbound queue.
+ * Many senders may push into it, but only the local rx_thread pops from it.
+ */
 static int cxl_queue_pop_wait(struct cxl_machine_queue *q, struct cxl_cmd *cmd,
 			      int timeout_ms)
 {
@@ -243,6 +257,7 @@ static int cxl_queue_pop_wait(struct cxl_machine_queue *q, struct cxl_cmd *cmd,
 	}
 }
 
+/* Map one alloc_id into this machine's fixed shared VA window. */
 static int cxl_map_fixed(struct cxl_macro_runtime *rt, uint64_t alloc_id,
 			 uint64_t va_offset, uint64_t size, int prot)
 {
@@ -256,6 +271,10 @@ static int cxl_map_fixed(struct cxl_macro_runtime *rt, uint64_t alloc_id,
 	return 0;
 }
 
+/*
+ * Remove a mapping from the window and immediately replace it with a PROT_NONE
+ * anonymous hole so the reserved window layout stays intact.
+ */
 static int cxl_unmap_fixed(struct cxl_macro_runtime *rt, uint64_t va_offset,
 			   uint64_t size)
 {
@@ -288,6 +307,7 @@ static cxl_entry_fn_t cxl_lookup_entry(struct cxl_macro_runtime *rt, uint32_t id
 	return fn;
 }
 
+/* Target-side pthread entry: call the locally resolved function. */
 static void *cxl_spawn_trampoline(void *arg)
 {
 	struct cxl_spawn_ctx *ctx = arg;
@@ -297,129 +317,9 @@ static void *cxl_spawn_trampoline(void *arg)
 	return NULL;
 }
 
-static int cxl_handle_cmd(struct cxl_macro_runtime *rt, const struct cxl_cmd *cmd)
-{
-	int ret = 0;
-	pthread_t tid;
-	struct cxl_spawn_ctx *spawn_ctx;
-	cxl_entry_fn_t fn;
-
-	if ((int)cmd->macro_id != rt->macro_id)
-		return 0;
-
-	switch (cmd->type) {
-	case CXL_CMD_MAP_REQ:
-		ret = cxl_map_fixed(rt, cmd->alloc_id, cmd->va_offset, cmd->size,
-				    cmd->prot);
-		cxl_barrier_ack(rt, cmd->cmd_id, rt->machine_bit, ret);
-		break;
-
-	case CXL_CMD_UNMAP_REQ:
-		ret = cxl_unmap_fixed(rt, cmd->va_offset, cmd->size);
-		cxl_barrier_ack(rt, cmd->cmd_id, rt->machine_bit, ret);
-		break;
-
-	case CXL_CMD_SPAWN_REQ:
-		fn = cxl_lookup_entry(rt, cmd->entry_id);
-		if (!fn) {
-			cxl_barrier_ack(rt, cmd->cmd_id, rt->machine_bit, -ENOENT);
-			break;
-		}
-		spawn_ctx = calloc(1, sizeof(*spawn_ctx));
-		if (!spawn_ctx) {
-			cxl_barrier_ack(rt, cmd->cmd_id, rt->machine_bit, -ENOMEM);
-			break;
-		}
-		spawn_ctx->fn = fn;
-		spawn_ctx->arg_u64 = cmd->arg_u64;
-		ret = pthread_create(&tid, NULL, cxl_spawn_trampoline, spawn_ctx);
-		if (ret) {
-			free(spawn_ctx);
-			cxl_barrier_ack(rt, cmd->cmd_id, rt->machine_bit, -ret);
-			break;
-		}
-		pthread_detach(tid);
-		cxl_barrier_ack(rt, cmd->cmd_id, rt->machine_bit, 0);
-		break;
-
-	case CXL_CMD_FATAL:
-		atomic_store(&rt->ctl->macros[rt->macro_id].fatal_flag, 1);
-		cxl_barrier_ack(rt, cmd->cmd_id, rt->machine_bit, 0);
-		break;
-
-	default:
-		break;
-	}
-
-	return 0;
-}
-
-static void cxl_update_heartbeat(struct cxl_macro_runtime *rt)
-{
-	atomic_store(&rt->ctl->machine_heartbeat_ns[rt->machine_id], cxl_now_ns());
-}
-
-static void cxl_check_membership_failure(struct cxl_macro_runtime *rt)
-{
-	uint64_t now_ns;
-	uint64_t timeout_ns;
-	uint64_t ready_mask;
-	int i;
-
-	timeout_ns = rt->ctl->heartbeat_timeout_ns;
-	if (!timeout_ns)
-		return;
-
-	ready_mask = atomic_load(&rt->ctl->ready_mask);
-	if ((ready_mask & rt->membership_mask) != rt->membership_mask)
-		return;
-
-	now_ns = cxl_now_ns();
-	for (i = 0; i < rt->nr_machines; i++) {
-		uint64_t bit = 1ULL << i;
-		uint64_t hb;
-
-		if (!(rt->membership_mask & bit))
-			continue;
-		hb = atomic_load(&rt->ctl->machine_heartbeat_ns[i]);
-		if (!hb)
-			continue;
-		if (now_ns - hb <= timeout_ns)
-			continue;
-
-		atomic_store(&rt->ctl->macros[rt->macro_id].fatal_flag, 1);
-		atomic_store(&rt->ctl->stop_flag, 1);
-		cxl_futex_wake(&rt->ctl->queues[rt->machine_id].doorbell, 1);
-		break;
-	}
-}
-
-static void *cxl_rx_loop(void *arg)
-{
-	struct cxl_macro_runtime *rt = arg;
-	struct cxl_machine_queue *q = &rt->ctl->queues[rt->machine_id];
-
-	atomic_store(&rt->started, 1);
-
-	while (!atomic_load(&rt->local_stop)) {
-		struct cxl_cmd cmd;
-
-		if (atomic_load(&rt->ctl->stop_flag))
-			break;
-		if (atomic_load(&rt->ctl->macros[rt->macro_id].fatal_flag))
-			break;
-
-		cxl_update_heartbeat(rt);
-		cxl_check_membership_failure(rt);
-		if (cxl_queue_pop_wait(q, &cmd, 50) == 0)
-			cxl_handle_cmd(rt, &cmd);
-	}
-
-	return NULL;
-}
-
-static int cxl_send_all(struct cxl_macro_runtime *rt, const struct cxl_cmd *base_cmd,
-			uint64_t mask)
+/* Send one command to every machine selected by mask. */
+static int cxl_send_mask(struct cxl_macro_runtime *rt, const struct cxl_cmd *base_cmd,
+			 uint64_t mask)
 {
 	int i;
 
@@ -438,7 +338,7 @@ static int cxl_send_all(struct cxl_macro_runtime *rt, const struct cxl_cmd *base
 }
 
 static struct cxl_local_alloc *cxl_find_alloc(struct cxl_macro_runtime *rt,
-					       void *ptr)
+					      void *ptr)
 {
 	struct cxl_local_alloc *it;
 
@@ -485,7 +385,6 @@ static void cxl_maprec_add(struct cxl_macro_runtime *rt, uint64_t alloc_id,
 		rec->va_offset = off;
 		rec->size = size;
 		rec->prot = prot;
-		rec->macro_id = rt->macro_id;
 		return;
 	}
 }
@@ -499,8 +398,6 @@ static void cxl_maprec_del(struct cxl_macro_runtime *rt, uint64_t alloc_id)
 
 		if (!atomic_load(&rec->active))
 			continue;
-		if (rec->macro_id != (uint32_t)rt->macro_id)
-			continue;
 		if (rec->alloc_id != alloc_id)
 			continue;
 		atomic_store(&rec->active, 0);
@@ -508,9 +405,87 @@ static void cxl_maprec_del(struct cxl_macro_runtime *rt, uint64_t alloc_id)
 	}
 }
 
+/*
+ * Execute one command that arrived in this machine's inbound queue.
+ * MAP_REQ / UNMAP_REQ update this process's shared CXL window.
+ * SPAWN_REQ creates a local pthread starting at the registered entry_id.
+ */
+static int cxl_handle_cmd(struct cxl_macro_runtime *rt, const struct cxl_cmd *cmd)
+{
+	int ret = 0;
+	pthread_t tid;
+	struct cxl_spawn_ctx *spawn_ctx;
+	cxl_entry_fn_t fn;
+
+	switch (cmd->type) {
+	case CXL_CMD_MAP_REQ:
+		ret = cxl_map_fixed(rt, cmd->alloc_id, cmd->va_offset, cmd->size,
+				    cmd->prot);
+		cxl_barrier_ack(rt, cmd->cmd_id, rt->machine_bit, ret);
+		break;
+
+	case CXL_CMD_UNMAP_REQ:
+		ret = cxl_unmap_fixed(rt, cmd->va_offset, cmd->size);
+		cxl_barrier_ack(rt, cmd->cmd_id, rt->machine_bit, ret);
+		break;
+
+	case CXL_CMD_SPAWN_REQ:
+		fn = cxl_lookup_entry(rt, cmd->entry_id);
+		if (!fn) {
+			cxl_barrier_ack(rt, cmd->cmd_id, rt->machine_bit, -ENOENT);
+			break;
+		}
+
+		spawn_ctx = calloc(1, sizeof(*spawn_ctx));
+		if (!spawn_ctx) {
+			cxl_barrier_ack(rt, cmd->cmd_id, rt->machine_bit, -ENOMEM);
+			break;
+		}
+
+		spawn_ctx->fn = fn;
+		spawn_ctx->arg_u64 = cmd->arg_u64;
+		ret = pthread_create(&tid, NULL, cxl_spawn_trampoline, spawn_ctx);
+		if (ret) {
+			free(spawn_ctx);
+			cxl_barrier_ack(rt, cmd->cmd_id, rt->machine_bit, -ret);
+			break;
+		}
+
+		pthread_detach(tid);
+		cxl_barrier_ack(rt, cmd->cmd_id, rt->machine_bit, 0);
+		break;
+
+	default:
+		break;
+	}
+
+	return 0;
+}
+
+/* Background receiver loop for one simulated machine-process. */
+static void *cxl_rx_loop(void *arg)
+{
+	struct cxl_macro_runtime *rt = arg;
+	struct cxl_machine_queue *q = &rt->ctl->queues[rt->machine_id];
+
+	atomic_store(&rt->started, 1);
+	while (!atomic_load(&rt->local_stop)) {
+		struct cxl_cmd cmd;
+
+		if (cxl_queue_pop_wait(q, &cmd, 50) == 0)
+			cxl_handle_cmd(rt, &cmd);
+	}
+
+	return NULL;
+}
+
+/*
+ * Allocate and initialize the shared control-plane inside CXL memory.
+ * Every simulated machine-process maps the same control region.
+ */
 int cxl_macro_control_create(int fd, int nr_machines, uint64_t window_base,
-			     uint64_t window_size, uint64_t timeout_ns,
-			     uint64_t *alloc_id_out, uint64_t *mapped_size_out,
+			     uint64_t window_size, uint64_t *alloc_id_out,
+			     uint64_t *mapped_size_out,
 			     struct cxl_control_plane **ctl_out)
 {
 	struct cxl_alloc_req req;
@@ -543,8 +518,8 @@ int cxl_macro_control_create(int fd, int nr_machines, uint64_t window_base,
 	ctl->nr_machines = nr_machines;
 	ctl->window_base = window_base;
 	ctl->window_size = window_size;
-	ctl->heartbeat_timeout_ns = timeout_ns;
 	atomic_store(&ctl->global_cmd_id, 1);
+	atomic_store(&ctl->va_next, 0);
 
 	*alloc_id_out = req.alloc_id;
 	*mapped_size_out = req.mapped_size;
@@ -552,13 +527,16 @@ int cxl_macro_control_create(int fd, int nr_machines, uint64_t window_base,
 	return 0;
 }
 
+/*
+ * Attach one machine-process to the control-plane and reserve the fixed VA
+ * window into which all shared CXL allocations will later be mapped.
+ */
 int cxl_macro_init(struct cxl_macro_runtime **rt_out,
 		   const struct cxl_macro_cfg *cfg)
 {
 	struct cxl_macro_runtime *rt;
 	off_t off;
 	void *ret;
-	struct cxl_macro_state *macro;
 	int rc;
 
 	if (!rt_out || !cfg)
@@ -566,8 +544,6 @@ int cxl_macro_init(struct cxl_macro_runtime **rt_out,
 	if (cfg->machine_id < 0 || cfg->machine_id >= cfg->nr_machines)
 		return -EINVAL;
 	if (cfg->nr_machines <= 0 || cfg->nr_machines > CXL_MACRO_MAX_MACHINES)
-		return -EINVAL;
-	if (cfg->macro_id < 0 || cfg->macro_id >= CXL_MACRO_MAX_MACROS)
 		return -EINVAL;
 
 	rt = calloc(1, sizeof(*rt));
@@ -582,12 +558,10 @@ int cxl_macro_init(struct cxl_macro_runtime **rt_out,
 
 	rt->machine_id = cfg->machine_id;
 	rt->nr_machines = cfg->nr_machines;
-	rt->macro_id = cfg->macro_id;
 	rt->machine_bit = 1ULL << cfg->machine_id;
-	rt->membership_mask = cfg->membership_mask;
+	rt->all_mask = (1ULL << cfg->nr_machines) - 1;
 	rt->window_base = cfg->window_base;
 	rt->window_size = cfg->window_size;
-	rt->control_alloc_id = cfg->control_alloc_id;
 	rt->control_size = cfg->control_size;
 
 	off = (off_t)cfg->control_alloc_id * getpagesize();
@@ -598,12 +572,8 @@ int cxl_macro_init(struct cxl_macro_runtime **rt_out,
 		goto err_fd;
 	}
 	if (rt->ctl->magic != CXL_MACRO_CTL_MAGIC ||
-	    rt->ctl->version != CXL_MACRO_CTL_VERSION) {
-		rc = -EINVAL;
-		goto err_ctl;
-	}
-
-	if (cfg->nr_machines != (int)rt->ctl->nr_machines) {
+	    rt->ctl->version != CXL_MACRO_CTL_VERSION ||
+	    cfg->nr_machines != (int)rt->ctl->nr_machines) {
 		rc = -EINVAL;
 		goto err_ctl;
 	}
@@ -614,17 +584,11 @@ int cxl_macro_init(struct cxl_macro_runtime **rt_out,
 		rc = -errno;
 		goto err_ctl;
 	}
-	rt->window_token = ret;
 
 	pthread_mutex_init(&rt->entry_lock, NULL);
 	pthread_mutex_init(&rt->alloc_lock, NULL);
 	atomic_store(&rt->local_stop, 0);
 	atomic_store(&rt->started, 0);
-
-	macro = &rt->ctl->macros[rt->macro_id];
-	macro->window_size = cfg->window_size;
-	atomic_store(&macro->membership_mask, cfg->membership_mask);
-	atomic_fetch_or(&macro->membership_mask, rt->machine_bit);
 
 	rc = pthread_create(&rt->rx_thread, NULL, cxl_rx_loop, rt);
 	if (rc) {
@@ -649,9 +613,11 @@ err_rt:
 	return rc;
 }
 
+/* Tear down the local runtime instance for one simulated machine. */
 void cxl_macro_destroy(struct cxl_macro_runtime *rt)
 {
-	struct cxl_local_alloc *it, *next;
+	struct cxl_local_alloc *it;
+	struct cxl_local_alloc *next;
 
 	if (!rt)
 		return;
@@ -663,11 +629,9 @@ void cxl_macro_destroy(struct cxl_macro_runtime *rt)
 
 	pthread_mutex_lock(&rt->alloc_lock);
 	for (it = rt->allocs; it; it = next) {
-		it = rt->allocs;
 		next = it->next;
 		munmap(it->addr, it->size);
 		free(it);
-		rt->allocs = next;
 	}
 	pthread_mutex_unlock(&rt->alloc_lock);
 
@@ -679,6 +643,7 @@ void cxl_macro_destroy(struct cxl_macro_runtime *rt)
 	free(rt);
 }
 
+/* Register one local function so remote spawn can refer to it by entry_id. */
 int cxl_macro_register_entry(struct cxl_macro_runtime *rt, uint32_t entry_id,
 			     cxl_entry_fn_t fn, const char *name)
 {
@@ -701,22 +666,31 @@ int cxl_macro_register_entry(struct cxl_macro_runtime *rt, uint32_t entry_id,
 
 	rt->entries[rt->nr_entries].id = entry_id;
 	rt->entries[rt->nr_entries].fn = fn;
-	if (name)
+	if (name) {
 		snprintf(rt->entries[rt->nr_entries].name,
 			 sizeof(rt->entries[rt->nr_entries].name), "%s", name);
+	}
 	rt->nr_entries++;
 	pthread_mutex_unlock(&rt->entry_lock);
 	return 0;
 }
 
+/*
+ * Distributed allocation flow:
+ * 1. Ask kernel for alloc_id + physical backing pages.
+ * 2. Reserve a VA offset from the shared fixed window.
+ * 3. Broadcast MAP_REQ to every machine.
+ * 4. Wait until every machine has installed the same mapping.
+ * 5. Return the local pointer window_base + va_offset.
+ */
 void *cxl_macro_malloc(struct cxl_macro_runtime *rt, size_t size, int timeout_ms)
 {
 	struct cxl_alloc_req req;
 	struct cxl_cmd cmd;
 	struct cxl_barrier *b = NULL;
+	struct cxl_local_alloc *alloc = NULL;
 	uint64_t cmd_id;
 	uint64_t va_off;
-	struct cxl_local_alloc *alloc = NULL;
 	int rc;
 
 	if (!rt || !size)
@@ -727,8 +701,7 @@ void *cxl_macro_malloc(struct cxl_macro_runtime *rt, size_t size, int timeout_ms
 	if (ioctl(rt->fd, CXL_ALLOC, &req) < 0)
 		return NULL;
 
-	va_off = atomic_fetch_add(&rt->ctl->macros[rt->macro_id].va_next,
-				  req.mapped_size);
+	va_off = atomic_fetch_add(&rt->ctl->va_next, req.mapped_size);
 	if (va_off + req.mapped_size > rt->window_size) {
 		struct cxl_free_req free_req = { .alloc_id = req.alloc_id };
 
@@ -738,21 +711,20 @@ void *cxl_macro_malloc(struct cxl_macro_runtime *rt, size_t size, int timeout_ms
 	}
 
 	cmd_id = atomic_fetch_add(&rt->ctl->global_cmd_id, 1);
-	rc = cxl_barrier_init(rt, cmd_id, rt->membership_mask, &b);
+	rc = cxl_barrier_init(rt, cmd_id, rt->all_mask, &b);
 	if (rc)
 		goto rollback_free;
 
 	memset(&cmd, 0, sizeof(cmd));
 	cmd.type = CXL_CMD_MAP_REQ;
 	cmd.cmd_id = cmd_id;
-	cmd.macro_id = rt->macro_id;
 	cmd.src_machine = rt->machine_id;
 	cmd.alloc_id = req.alloc_id;
 	cmd.va_offset = va_off;
 	cmd.size = req.mapped_size;
 	cmd.prot = PROT_READ | PROT_WRITE;
 
-	rc = cxl_send_all(rt, &cmd, rt->membership_mask);
+	rc = cxl_send_mask(rt, &cmd, rt->all_mask);
 	if (rc)
 		goto rollback_barrier;
 
@@ -774,7 +746,8 @@ void *cxl_macro_malloc(struct cxl_macro_runtime *rt, size_t size, int timeout_ms
 	cxl_add_local_alloc(rt, alloc);
 	pthread_mutex_unlock(&rt->alloc_lock);
 
-	cxl_maprec_add(rt, req.alloc_id, va_off, req.mapped_size, PROT_READ | PROT_WRITE);
+	cxl_maprec_add(rt, req.alloc_id, va_off, req.mapped_size,
+		       PROT_READ | PROT_WRITE);
 	cxl_barrier_fini(b);
 	return alloc->addr;
 
@@ -784,16 +757,15 @@ rollback_barrier: {
 		struct cxl_free_req free_req = { .alloc_id = req.alloc_id };
 		uint64_t rollback_id = atomic_fetch_add(&rt->ctl->global_cmd_id, 1);
 
-		if (!cxl_barrier_init(rt, rollback_id, rt->membership_mask, &rb)) {
+		if (!cxl_barrier_init(rt, rollback_id, rt->all_mask, &rb)) {
 			memset(&unmap_cmd, 0, sizeof(unmap_cmd));
 			unmap_cmd.type = CXL_CMD_UNMAP_REQ;
 			unmap_cmd.cmd_id = rollback_id;
-			unmap_cmd.macro_id = rt->macro_id;
 			unmap_cmd.src_machine = rt->machine_id;
 			unmap_cmd.alloc_id = req.alloc_id;
 			unmap_cmd.va_offset = va_off;
 			unmap_cmd.size = req.mapped_size;
-			cxl_send_all(rt, &unmap_cmd, rt->membership_mask);
+			cxl_send_mask(rt, &unmap_cmd, rt->all_mask);
 			cxl_barrier_wait(rb, 1000);
 			cxl_barrier_fini(rb);
 		}
@@ -812,6 +784,13 @@ rollback_free: {
 	}
 }
 
+/*
+ * Distributed free flow:
+ * 1. Look up the local alloc_id/offset for ptr.
+ * 2. Broadcast UNMAP_REQ to every machine.
+ * 3. Wait for all ACKs.
+ * 4. Return alloc_id to the kernel allocator.
+ */
 int cxl_macro_free(struct cxl_macro_runtime *rt, void *ptr, int timeout_ms)
 {
 	struct cxl_local_alloc *alloc;
@@ -834,20 +813,19 @@ int cxl_macro_free(struct cxl_macro_runtime *rt, void *ptr, int timeout_ms)
 	pthread_mutex_unlock(&rt->alloc_lock);
 
 	cmd_id = atomic_fetch_add(&rt->ctl->global_cmd_id, 1);
-	rc = cxl_barrier_init(rt, cmd_id, rt->membership_mask, &b);
+	rc = cxl_barrier_init(rt, cmd_id, rt->all_mask, &b);
 	if (rc)
 		goto restore_alloc;
 
 	memset(&cmd, 0, sizeof(cmd));
 	cmd.type = CXL_CMD_UNMAP_REQ;
 	cmd.cmd_id = cmd_id;
-	cmd.macro_id = rt->macro_id;
 	cmd.src_machine = rt->machine_id;
 	cmd.alloc_id = alloc->alloc_id;
 	cmd.va_offset = alloc->va_offset;
 	cmd.size = alloc->size;
 
-	rc = cxl_send_all(rt, &cmd, rt->membership_mask);
+	rc = cxl_send_mask(rt, &cmd, rt->all_mask);
 	if (rc) {
 		cxl_barrier_fini(b);
 		goto restore_alloc;
@@ -875,6 +853,10 @@ restore_alloc:
 	return rc;
 }
 
+/*
+ * Ask target_machine to create a local pthread and start executing the local
+ * function registered under entry_id.
+ */
 int cxl_spawn_remote(struct cxl_macro_runtime *rt, int target_machine,
 		     uint32_t entry_id, uint64_t arg_u64,
 		     uint64_t *thread_id_out, int timeout_ms)
@@ -897,9 +879,7 @@ int cxl_spawn_remote(struct cxl_macro_runtime *rt, int target_machine,
 	memset(&cmd, 0, sizeof(cmd));
 	cmd.type = CXL_CMD_SPAWN_REQ;
 	cmd.cmd_id = cmd_id;
-	cmd.macro_id = rt->macro_id;
 	cmd.src_machine = rt->machine_id;
-	cmd.dst_machine = target_machine;
 	cmd.entry_id = entry_id;
 	cmd.arg_u64 = arg_u64;
 	cmd.thread_id = cmd_id;
@@ -917,74 +897,6 @@ int cxl_spawn_remote(struct cxl_macro_runtime *rt, int target_machine,
 
 	if (thread_id_out)
 		*thread_id_out = cmd_id;
-	return 0;
-}
-
-int cxl_macro_set_ready(struct cxl_macro_runtime *rt)
-{
-	if (!rt)
-		return -EINVAL;
-
-	atomic_fetch_or(&rt->ctl->ready_mask, rt->machine_bit);
-	return 0;
-}
-
-uint64_t cxl_macro_get_ready_mask(struct cxl_macro_runtime *rt)
-{
-	if (!rt)
-		return 0;
-	return atomic_load(&rt->ctl->ready_mask);
-}
-
-int cxl_macro_wait_ready(struct cxl_macro_runtime *rt, uint64_t target_mask,
-			 int timeout_ms)
-{
-	uint64_t start_ns = cxl_now_ns();
-	uint64_t timeout_ns;
-
-	if (!rt)
-		return -EINVAL;
-
-	timeout_ns = (timeout_ms < 0) ? UINT64_MAX :
-				      (uint64_t)timeout_ms * 1000000ULL;
-	while ((atomic_load(&rt->ctl->ready_mask) & target_mask) != target_mask) {
-		if (timeout_ns != UINT64_MAX &&
-		    cxl_now_ns() - start_ns > timeout_ns)
-			return -ETIMEDOUT;
-		usleep(1000);
-	}
-	return 0;
-}
-
-int cxl_macro_request_stop(struct cxl_macro_runtime *rt)
-{
-	int i;
-
-	if (!rt)
-		return -EINVAL;
-	atomic_store(&rt->ctl->stop_flag, 1);
-	for (i = 0; i < rt->nr_machines; i++) {
-		atomic_fetch_add(&rt->ctl->queues[i].doorbell, 1);
-		cxl_futex_wake(&rt->ctl->queues[i].doorbell, 1);
-	}
-	return 0;
-}
-
-int cxl_macro_wait_stop(struct cxl_macro_runtime *rt, int timeout_ms)
-{
-	uint64_t start_ns = cxl_now_ns();
-	uint64_t timeout_ns;
-
-	if (!rt)
-		return -EINVAL;
-	timeout_ns = (timeout_ms < 0) ? UINT64_MAX :
-				      (uint64_t)timeout_ms * 1000000ULL;
-	while (!atomic_load(&rt->ctl->stop_flag)) {
-		if (timeout_ns != UINT64_MAX &&
-		    cxl_now_ns() - start_ns > timeout_ns)
-			return -ETIMEDOUT;
-		usleep(1000);
-	}
 	return 0;
 }
 
