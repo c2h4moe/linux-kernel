@@ -11,12 +11,14 @@
 #include <limits.h>
 #include <linux/futex.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -93,9 +95,26 @@ struct cxl_app {
 	size_t nr_large_allocs;
 };
 
+struct cxl_worker_desc {
+	const char *name;
+	cxl_worker_fn_t worker;
+	void *(*entry_fn)(void *arg);
+	uint32_t id;
+	struct cxl_worker_desc *next;
+};
+
 static const uint16_t cxl_size_classes[] = {
 	16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384,
 };
+
+static pthread_mutex_t cxl_worker_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct cxl_worker_desc *cxl_workers;
+static int cxl_worker_registry_error;
+/* One simulated machine-process owns exactly one app context. */
+static struct cxl_app *cxl_process_app;
+/* User-facing helpers resolve the current app through thread-local state. */
+static __thread struct cxl_app *cxl_current_app_tls;
+static cxl_main_fn_t cxl_run_main_fn;
 
 static uint64_t cxl_now_ns(void)
 {
@@ -103,6 +122,173 @@ static uint64_t cxl_now_ns(void)
 
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static uint32_t cxl_worker_hash(const char *name)
+{
+	const unsigned char *p = (const unsigned char *)name;
+	uint32_t hash = 2166136261u;
+
+	while (*p) {
+		hash ^= *p++;
+		hash *= 16777619u;
+	}
+	if (hash == 0)
+		hash = 1;
+	return hash;
+}
+
+static void cxl_set_current_app(struct cxl_app *app)
+{
+	cxl_current_app_tls = app;
+}
+
+static struct cxl_app *cxl_get_current_app(void)
+{
+	if (cxl_current_app_tls)
+		return cxl_current_app_tls;
+	return cxl_process_app;
+}
+
+static struct cxl_worker_desc *cxl_find_worker_by_fn(cxl_worker_fn_t worker)
+{
+	struct cxl_worker_desc *it;
+
+	for (it = cxl_workers; it; it = it->next) {
+		if (it->worker == worker)
+			return it;
+	}
+	return NULL;
+}
+
+static int cxl_install_workers(struct cxl_app *app)
+{
+	struct cxl_worker_desc *it;
+
+	/* Every machine installs the same worker ID -> wrapper table locally. */
+	pthread_mutex_lock(&cxl_worker_lock);
+	for (it = cxl_workers; it; it = it->next) {
+		int rc = cxl_macro_register_entry(app->rt, it->id, it->entry_fn,
+						 it->name);
+
+		if (rc && rc != -EEXIST) {
+			pthread_mutex_unlock(&cxl_worker_lock);
+			return rc;
+		}
+	}
+	pthread_mutex_unlock(&cxl_worker_lock);
+	return 0;
+}
+
+static int cxl_ptr_is_shared(struct cxl_app *app, const void *ptr)
+{
+	uintptr_t ptr_u;
+	uint64_t base;
+	uint64_t size;
+
+	if (!ptr)
+		return 1;
+
+	ptr_u = (uintptr_t)ptr;
+	base = app->ctl->window_base;
+	size = app->ctl->window_size;
+	return ptr_u >= base && ptr_u < base + size;
+}
+
+static int cxl_mutex_is_shared(struct cxl_mutex *lock, struct cxl_app **app_out)
+{
+	struct cxl_app *app = cxl_get_current_app();
+
+	if (!app)
+		return -EINVAL;
+	if (!lock)
+		return -EINVAL;
+	if (!cxl_ptr_is_shared(app, lock))
+		return -ERANGE;
+	if (app_out)
+		*app_out = app;
+	return 0;
+}
+
+static int cxl_mutex_validate_live(struct cxl_mutex *lock)
+{
+	int rc = cxl_mutex_is_shared(lock, NULL);
+
+	if (rc)
+		return rc;
+	if (atomic_load_explicit(&lock->magic, memory_order_acquire) !=
+	    CXL_MUTEX_MAGIC)
+		return -EINVAL;
+	return 0;
+}
+
+static void cxl_mutex_spin_pause(unsigned int *spins)
+{
+	(*spins)++;
+#if defined(__x86_64__) || defined(__i386__)
+	__asm__ __volatile__("pause");
+#endif
+	if ((*spins & 0x3fffU) == 0)
+		sched_yield();
+}
+
+int cxl_worker_register_internal(const char *name, cxl_worker_fn_t worker,
+				 void *(*entry_fn)(void *arg))
+{
+	struct cxl_worker_desc *it;
+	struct cxl_worker_desc *desc;
+	uint32_t id;
+
+	if (!name || !worker || !entry_fn)
+		return -EINVAL;
+
+	id = cxl_worker_hash(name);
+	pthread_mutex_lock(&cxl_worker_lock);
+	for (it = cxl_workers; it; it = it->next) {
+		if (it->worker == worker) {
+			if (strcmp(it->name, name) == 0 && it->entry_fn == entry_fn) {
+				pthread_mutex_unlock(&cxl_worker_lock);
+				return 0;
+			}
+			if (!cxl_worker_registry_error)
+				cxl_worker_registry_error = -EEXIST;
+			pthread_mutex_unlock(&cxl_worker_lock);
+			return -EEXIST;
+		}
+		if (it->id == id && strcmp(it->name, name) != 0) {
+			if (!cxl_worker_registry_error)
+				cxl_worker_registry_error = -EEXIST;
+			pthread_mutex_unlock(&cxl_worker_lock);
+			return -EEXIST;
+		}
+	}
+
+	desc = calloc(1, sizeof(*desc));
+	if (!desc) {
+		if (!cxl_worker_registry_error)
+			cxl_worker_registry_error = -ENOMEM;
+		pthread_mutex_unlock(&cxl_worker_lock);
+		return -ENOMEM;
+	}
+
+	desc->name = name;
+	desc->worker = worker;
+	desc->entry_fn = entry_fn;
+	desc->id = id;
+	desc->next = cxl_workers;
+	cxl_workers = desc;
+	pthread_mutex_unlock(&cxl_worker_lock);
+	return 0;
+}
+
+void *cxl_worker_invoke_internal(cxl_worker_fn_t worker, void *arg)
+{
+	struct cxl_app *app = cxl_process_app;
+	int rc;
+
+	cxl_set_current_app(app);
+	rc = worker(arg);
+	return (void *)(intptr_t)rc;
 }
 
 static int cxl_futex_wait(_Atomic uint32_t *uaddr, uint32_t val, int ms)
@@ -531,6 +717,15 @@ static int cxl_app_child_main(int machine_id, const struct cxl_app_cfg *cfg,
 	app.rt = rt;
 	app.ctl = cxl_macro_ctl(rt);
 	pthread_mutex_init(&app.alloc_lock, NULL);
+	cxl_process_app = &app;
+	cxl_set_current_app(&app);
+
+	rc = cxl_install_workers(&app);
+	if (rc) {
+		pthread_mutex_destroy(&app.alloc_lock);
+		cxl_macro_destroy(rt);
+		return 2;
+	}
 
 	atomic_fetch_add(&app.ctl->launch_ready, 1);
 	atomic_fetch_add(&app.ctl->launch_futex, 1);
@@ -541,8 +736,31 @@ static int cxl_app_child_main(int machine_id, const struct cxl_app_cfg *cfg,
 		rc = app_main(&app);
 
 	pthread_mutex_destroy(&app.alloc_lock);
+	cxl_set_current_app(NULL);
+	cxl_process_app = NULL;
 	cxl_macro_destroy(rt);
 	return rc ? 2 : 0;
+}
+
+static int cxl_app_run_bridge(struct cxl_app *app)
+{
+	(void)app;
+	if (!cxl_run_main_fn)
+		return -EINVAL;
+	return cxl_run_main_fn();
+}
+
+static void cxl_terminate_children(pid_t *pids, int nr_machines, int except_idx,
+				       bool *terminated)
+{
+	int i;
+
+	for (i = 0; i < nr_machines; i++) {
+		if (i == except_idx || pids[i] <= 0)
+			continue;
+		if (kill(pids[i], SIGTERM) == 0 || errno == ESRCH)
+			terminated[i] = true;
+	}
 }
 
 int cxl_app_run(const struct cxl_app_cfg *cfg, cxl_app_main_fn_t app_main)
@@ -554,11 +772,15 @@ int cxl_app_run(const struct cxl_app_cfg *cfg, cxl_app_main_fn_t app_main)
 	struct cxl_control_plane *ctl = NULL;
 	struct cxl_free_req free_req;
 	pid_t pids[CXL_MACRO_MAX_MACHINES] = { 0 };
+	bool terminated[CXL_MACRO_MAX_MACHINES] = { false };
 	int exit_code = 0;
+	int remaining = 0;
 	int i;
 
 	if (!cfg || !app_main)
 		return -EINVAL;
+	if (cxl_worker_registry_error)
+		return cxl_worker_registry_error;
 
 	local_cfg = *cfg;
 	if (local_cfg.nr_machines <= 0)
@@ -595,12 +817,17 @@ int cxl_app_run(const struct cxl_app_cfg *cfg, cxl_app_main_fn_t app_main)
 			_exit(cxl_app_child_main(i, &local_cfg, control_alloc_id,
 						 control_size, app_main));
 		pids[i] = pid;
+		remaining++;
 	}
+
+	if (exit_code != 0)
+		cxl_terminate_children(pids, local_cfg.nr_machines, -1, terminated);
 
 	if (exit_code == 0 &&
 	    cxl_wait_for_children(ctl, local_cfg.nr_machines,
 				  local_cfg.timeout_ms)) {
 		exit_code = 1;
+		cxl_terminate_children(pids, local_cfg.nr_machines, -1, terminated);
 	}
 
 	if (exit_code == 0) {
@@ -609,17 +836,43 @@ int cxl_app_run(const struct cxl_app_cfg *cfg, cxl_app_main_fn_t app_main)
 		cxl_futex_wake(&ctl->launch_futex, INT_MAX);
 	}
 
-	for (i = 0; i < local_cfg.nr_machines; i++) {
+	while (remaining > 0) {
+		pid_t pid;
 		int st;
+		int idx = -1;
 
-		if (pids[i] <= 0)
-			continue;
-		if (waitpid(pids[i], &st, 0) < 0) {
+		pid = waitpid(-1, &st, 0);
+		if (pid < 0) {
 			exit_code = 1;
 			continue;
 		}
-		if (!WIFEXITED(st) || WEXITSTATUS(st) != 0)
+		for (i = 0; i < local_cfg.nr_machines; i++) {
+			if (pids[i] == pid) {
+				idx = i;
+				pids[i] = 0;
+				remaining--;
+				break;
+			}
+		}
+		if (idx < 0)
+			continue;
+
+		if (idx == 0) {
+			if (!WIFEXITED(st) || WEXITSTATUS(st) != 0)
+				exit_code = 1;
+			cxl_terminate_children(pids, local_cfg.nr_machines, 0,
+					       terminated);
+			continue;
+		}
+
+		if (terminated[idx])
+			continue;
+
+		if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
 			exit_code = 1;
+			cxl_terminate_children(pids, local_cfg.nr_machines, idx,
+					       terminated);
+		}
 	}
 
 	munmap(ctl, control_size);
@@ -631,6 +884,19 @@ int cxl_app_run(const struct cxl_app_cfg *cfg, cxl_app_main_fn_t app_main)
 	return exit_code ? 1 : 0;
 }
 
+int cxl_run(const struct cxl_app_cfg *cfg, cxl_main_fn_t main_fn)
+{
+	int rc;
+
+	if (!main_fn)
+		return -EINVAL;
+
+	cxl_run_main_fn = main_fn;
+	rc = cxl_app_run(cfg, cxl_app_run_bridge);
+	cxl_run_main_fn = NULL;
+	return rc;
+}
+
 int cxl_machine_id(struct cxl_app *app)
 {
 	return app ? app->machine_id : -1;
@@ -639,6 +905,137 @@ int cxl_machine_id(struct cxl_app *app)
 int cxl_machine_count(struct cxl_app *app)
 {
 	return app ? app->nr_machines : -1;
+}
+
+int cxl_current_machine(void)
+{
+	return cxl_machine_id(cxl_get_current_app());
+}
+
+int cxl_current_machine_count(void)
+{
+	return cxl_machine_count(cxl_get_current_app());
+}
+
+int cxl_mutex_init(struct cxl_mutex *lock)
+{
+	int rc = cxl_mutex_is_shared(lock, NULL);
+
+	if (rc)
+		return rc;
+
+	atomic_store_explicit(&lock->next_ticket, 0, memory_order_relaxed);
+	atomic_store_explicit(&lock->now_serving, 0, memory_order_relaxed);
+	atomic_store_explicit(&lock->magic, CXL_MUTEX_MAGIC, memory_order_release);
+	atomic_store_explicit(&lock->reserved, 0, memory_order_relaxed);
+	return 0;
+}
+
+int cxl_mutex_destroy(struct cxl_mutex *lock)
+{
+	uint32_t next_ticket;
+	uint32_t now_serving;
+	int rc = cxl_mutex_validate_live(lock);
+
+	if (rc)
+		return rc;
+
+	next_ticket = atomic_load_explicit(&lock->next_ticket, memory_order_acquire);
+	now_serving = atomic_load_explicit(&lock->now_serving, memory_order_acquire);
+	if (next_ticket != now_serving)
+		return -EBUSY;
+
+	atomic_store_explicit(&lock->magic, 0, memory_order_release);
+	atomic_store_explicit(&lock->reserved, 0, memory_order_relaxed);
+	return 0;
+}
+
+struct cxl_mutex *cxl_mutex_create(void)
+{
+	struct cxl_mutex *lock;
+
+	lock = cxl_malloc_current(sizeof(*lock));
+	if (!lock)
+		return NULL;
+	if (cxl_mutex_init(lock)) {
+		cxl_free_current(lock);
+		errno = EINVAL;
+		return NULL;
+	}
+	return lock;
+}
+
+int cxl_mutex_free(struct cxl_mutex *lock)
+{
+	int rc;
+
+	rc = cxl_mutex_destroy(lock);
+	if (rc)
+		return rc;
+	return cxl_free_current(lock);
+}
+
+int cxl_mutex_lock(struct cxl_mutex *lock)
+{
+	uint32_t my_ticket;
+	unsigned int spins = 0;
+	int rc = cxl_mutex_validate_live(lock);
+
+	if (rc)
+		return rc;
+
+	my_ticket = atomic_fetch_add_explicit(&lock->next_ticket, 1,
+					       memory_order_acq_rel);
+	for (;;) {
+		uint32_t now_serving =
+			atomic_load_explicit(&lock->now_serving, memory_order_acquire);
+
+		if (now_serving == my_ticket)
+			return 0;
+		cxl_mutex_spin_pause(&spins);
+	}
+}
+
+int cxl_mutex_unlock(struct cxl_mutex *lock)
+{
+	uint32_t next_ticket;
+	uint32_t now_serving;
+	int rc = cxl_mutex_validate_live(lock);
+
+	if (rc)
+		return rc;
+
+	now_serving = atomic_load_explicit(&lock->now_serving, memory_order_acquire);
+	next_ticket = atomic_load_explicit(&lock->next_ticket, memory_order_acquire);
+	if (next_ticket == now_serving)
+		return -EPERM;
+
+	atomic_fetch_add_explicit(&lock->now_serving, 1, memory_order_release);
+	return 0;
+}
+
+int cxl_mutex_trylock(struct cxl_mutex *lock)
+{
+	uint32_t next_ticket;
+	uint32_t now_serving;
+	int rc = cxl_mutex_validate_live(lock);
+
+	if (rc)
+		return rc;
+
+	now_serving = atomic_load_explicit(&lock->now_serving, memory_order_acquire);
+	next_ticket = atomic_load_explicit(&lock->next_ticket, memory_order_acquire);
+	if (next_ticket != now_serving)
+		return -EBUSY;
+
+	if (!atomic_compare_exchange_strong_explicit(&lock->next_ticket,
+						     &next_ticket,
+						     next_ticket + 1,
+						     memory_order_acq_rel,
+						     memory_order_acquire))
+		return -EBUSY;
+
+	return 0;
 }
 
 void *cxl_malloc(struct cxl_app *app, size_t size)
@@ -674,6 +1071,57 @@ int cxl_free(struct cxl_app *app, void *ptr)
 	default:
 		return -EINVAL;
 	}
+}
+
+void *cxl_malloc_current(size_t size)
+{
+	return cxl_malloc(cxl_get_current_app(), size);
+}
+
+int cxl_free_current(void *ptr)
+{
+	return cxl_free(cxl_get_current_app(), ptr);
+}
+
+int cxl_app_spawn(struct cxl_app *app, cxl_worker_fn_t worker,
+		  int target_machine, void *shared_arg)
+{
+	struct cxl_worker_desc *desc;
+
+	if (!app || !worker)
+		return -EINVAL;
+	if (target_machine < 0 || target_machine >= app->nr_machines)
+		return -EINVAL;
+	if (!cxl_ptr_is_shared(app, shared_arg))
+		return -ERANGE;
+	if (cxl_worker_registry_error)
+		return cxl_worker_registry_error;
+
+	pthread_mutex_lock(&cxl_worker_lock);
+	desc = cxl_find_worker_by_fn(worker);
+	pthread_mutex_unlock(&cxl_worker_lock);
+	if (!desc)
+		return -ENOENT;
+
+	if (target_machine == app->machine_id) {
+		pthread_t tid;
+		int rc = pthread_create(&tid, NULL, desc->entry_fn, shared_arg);
+
+		if (rc)
+			return -rc;
+		pthread_detach(tid);
+		return 0;
+	}
+
+	return cxl_spawn_remote(app->rt, target_machine, desc->id,
+				(uint64_t)(uintptr_t)shared_arg, NULL,
+				app->timeout_ms);
+}
+
+int cxl_spawn(cxl_worker_fn_t worker, int target_machine, void *shared_arg)
+{
+	return cxl_app_spawn(cxl_get_current_app(), worker, target_machine,
+			     shared_arg);
 }
 
 int cxl_app_store_u32(struct cxl_app *app, unsigned int slot, uint32_t value)
@@ -728,4 +1176,24 @@ void *cxl_app_load_ptr(struct cxl_app *app, unsigned int slot)
 		return NULL;
 
 	return (void *)(uintptr_t)(app->ctl->window_base + (uint64_t)(encoded - 1));
+}
+
+int cxl_store_u32(unsigned int slot, uint32_t value)
+{
+	return cxl_app_store_u32(cxl_get_current_app(), slot, value);
+}
+
+uint32_t cxl_load_u32(unsigned int slot)
+{
+	return cxl_app_load_u32(cxl_get_current_app(), slot);
+}
+
+int cxl_store_ptr(unsigned int slot, const void *ptr)
+{
+	return cxl_app_store_ptr(cxl_get_current_app(), slot, ptr);
+}
+
+void *cxl_load_ptr(unsigned int slot)
+{
+	return cxl_app_load_ptr(cxl_get_current_app(), slot);
 }
