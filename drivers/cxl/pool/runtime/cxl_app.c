@@ -232,6 +232,16 @@ static void cxl_mutex_spin_pause(unsigned int *spins)
 		sched_yield();
 }
 
+static void cxl_mutex_backoff(unsigned int *spins, unsigned int *delay)
+{
+	unsigned int i;
+
+	for (i = 0; i < *delay; i++)
+		cxl_mutex_spin_pause(spins);
+	if (*delay < 1024U)
+		*delay <<= 1;
+}
+
 int cxl_worker_register_internal(const char *name, cxl_worker_fn_t worker,
 				 void *(*entry_fn)(void *arg))
 {
@@ -924,29 +934,28 @@ int cxl_mutex_init(struct cxl_mutex *lock)
 	if (rc)
 		return rc;
 
-	atomic_store_explicit(&lock->next_ticket, 0, memory_order_relaxed);
-	atomic_store_explicit(&lock->now_serving, 0, memory_order_relaxed);
+	atomic_store_explicit(&lock->state, 0, memory_order_relaxed);
 	atomic_store_explicit(&lock->magic, CXL_MUTEX_MAGIC, memory_order_release);
 	atomic_store_explicit(&lock->reserved, 0, memory_order_relaxed);
+	atomic_store_explicit(&lock->pad, 0, memory_order_relaxed);
 	return 0;
 }
 
 int cxl_mutex_destroy(struct cxl_mutex *lock)
 {
-	uint32_t next_ticket;
-	uint32_t now_serving;
+	uint32_t state;
 	int rc = cxl_mutex_validate_live(lock);
 
 	if (rc)
 		return rc;
 
-	next_ticket = atomic_load_explicit(&lock->next_ticket, memory_order_acquire);
-	now_serving = atomic_load_explicit(&lock->now_serving, memory_order_acquire);
-	if (next_ticket != now_serving)
+	state = atomic_load_explicit(&lock->state, memory_order_acquire);
+	if (state != 0)
 		return -EBUSY;
 
 	atomic_store_explicit(&lock->magic, 0, memory_order_release);
 	atomic_store_explicit(&lock->reserved, 0, memory_order_relaxed);
+	atomic_store_explicit(&lock->pad, 0, memory_order_relaxed);
 	return 0;
 }
 
@@ -977,60 +986,50 @@ int cxl_mutex_free(struct cxl_mutex *lock)
 
 int cxl_mutex_lock(struct cxl_mutex *lock)
 {
-	uint32_t my_ticket;
 	unsigned int spins = 0;
+	unsigned int delay = 4;
 	int rc = cxl_mutex_validate_live(lock);
 
 	if (rc)
 		return rc;
 
-	my_ticket = atomic_fetch_add_explicit(&lock->next_ticket, 1,
-					       memory_order_acq_rel);
 	for (;;) {
-		uint32_t now_serving =
-			atomic_load_explicit(&lock->now_serving, memory_order_acquire);
+		uint32_t expected = 0;
 
-		if (now_serving == my_ticket)
+		while (atomic_load_explicit(&lock->state, memory_order_acquire) != 0)
+			cxl_mutex_backoff(&spins, &delay);
+
+		if (atomic_compare_exchange_weak_explicit(&lock->state, &expected, 1,
+							  memory_order_acq_rel,
+							  memory_order_acquire))
 			return 0;
-		cxl_mutex_spin_pause(&spins);
+		cxl_mutex_backoff(&spins, &delay);
 	}
 }
 
 int cxl_mutex_unlock(struct cxl_mutex *lock)
 {
-	uint32_t next_ticket;
-	uint32_t now_serving;
+	uint32_t old_state;
 	int rc = cxl_mutex_validate_live(lock);
 
 	if (rc)
 		return rc;
 
-	now_serving = atomic_load_explicit(&lock->now_serving, memory_order_acquire);
-	next_ticket = atomic_load_explicit(&lock->next_ticket, memory_order_acquire);
-	if (next_ticket == now_serving)
+	old_state = atomic_exchange_explicit(&lock->state, 0, memory_order_release);
+	if (old_state == 0)
 		return -EPERM;
-
-	atomic_fetch_add_explicit(&lock->now_serving, 1, memory_order_release);
 	return 0;
 }
 
 int cxl_mutex_trylock(struct cxl_mutex *lock)
 {
-	uint32_t next_ticket;
-	uint32_t now_serving;
+	uint32_t expected = 0;
 	int rc = cxl_mutex_validate_live(lock);
 
 	if (rc)
 		return rc;
 
-	now_serving = atomic_load_explicit(&lock->now_serving, memory_order_acquire);
-	next_ticket = atomic_load_explicit(&lock->next_ticket, memory_order_acquire);
-	if (next_ticket != now_serving)
-		return -EBUSY;
-
-	if (!atomic_compare_exchange_strong_explicit(&lock->next_ticket,
-						     &next_ticket,
-						     next_ticket + 1,
+	if (!atomic_compare_exchange_strong_explicit(&lock->state, &expected, 1,
 						     memory_order_acq_rel,
 						     memory_order_acquire))
 		return -EBUSY;

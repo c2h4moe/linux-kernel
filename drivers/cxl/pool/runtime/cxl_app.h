@@ -18,10 +18,10 @@ typedef int (*cxl_main_fn_t)(void);
 typedef int (*cxl_worker_fn_t)(void *arg);
 
 struct cxl_mutex {
-	_Atomic uint32_t next_ticket;
-	_Atomic uint32_t now_serving;
+	_Atomic uint32_t state;
 	_Atomic uint32_t magic;
 	_Atomic uint32_t reserved;
+	_Atomic uint32_t pad;
 };
 
 struct cxl_app_cfg {

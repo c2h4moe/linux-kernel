@@ -15,9 +15,9 @@ The user-facing layer now provides a simpler API:
 - `CXL_WORKER(name)` to register a remote-spawnable worker,
 - `cxl_spawn(worker, machine, shared_ptr)` to start that worker on another machine,
 - `cxl_malloc_current()` / `cxl_free_current()` for shared allocations from the current thread,
-- `cxl_mutex_init/destroy/create/free/lock/unlock/trylock` for shared ticket locks.
+- `cxl_mutex_init/destroy/create/free/lock/unlock/trylock` for shared spin-based mutexes.
 
-`cxl_mutex` is a fair ticket lock implemented only with shared-memory atomics.
+`cxl_mutex` is a shared-memory mutex implemented with atomics and spin backoff.
 The lock object itself must live in the CXL shared window, either:
 
 - embedded in a shared struct and initialized with `cxl_mutex_init()`, or
