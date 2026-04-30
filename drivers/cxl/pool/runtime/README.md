@@ -57,6 +57,54 @@ Run the mutex demo with 2 simulated machines:
 ./cxl_mutex_demo 2
 ```
 
+Run the single-machine mutex benchmark:
+
+```bash
+./pthread_mutex_bench [threads] [total_ops]
+```
+
+Run the CXL mutex benchmark:
+
+```bash
+./cxl_mutex_bench [machines] [threads] [total_ops]
+```
+
+Run the CXL no-lock single-thread benchmark:
+
+```bash
+./cxl_nolock_bench [total_ops]
+```
+
+Run the DRAM spinlock benchmark:
+
+```bash
+./dram_spin_bench [threads] [total_ops]
+```
+
+Run the Redis network counter benchmark (start `redis-server` first):
+
+```bash
+./redis_incr_bench [threads] [total_ops] [host] [port] [key]
+```
+
+Run the Redis lock-based critical-section benchmark:
+
+```bash
+./redis_lock_bench [threads] [total_ops] [host] [port] [counter_key] [lock_key]
+```
+
+Collect CSV data and optionally generate a plot:
+
+```bash
+python3 collect_mutex_bench.py
+```
+
+The script always writes CSV files. If `matplotlib` is available, it also
+generates `bench_results/mutex_bench.png`.
+
+Current benchmark defaults use `total_ops=5000` so the QEMU-based CXL runs can
+finish in a practical amount of time.
+
 Expected success line:
 
 ```text

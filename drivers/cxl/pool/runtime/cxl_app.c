@@ -85,6 +85,8 @@ struct cxl_app {
 	int machine_id;
 	int nr_machines;
 	int timeout_ms;
+	uint64_t window_base;
+	uint64_t window_size;
 	struct cxl_macro_runtime *rt;
 	struct cxl_control_plane *ctl;
 
@@ -190,8 +192,8 @@ static int cxl_ptr_is_shared(struct cxl_app *app, const void *ptr)
 		return 1;
 
 	ptr_u = (uintptr_t)ptr;
-	base = app->ctl->window_base;
-	size = app->ctl->window_size;
+	base = app->window_base;
+	size = app->window_size;
 	return ptr_u >= base && ptr_u < base + size;
 }
 
@@ -222,6 +224,15 @@ static int cxl_mutex_validate_live(struct cxl_mutex *lock)
 	return 0;
 }
 
+static inline int cxl_mutex_fast_validate(struct cxl_mutex *lock)
+{
+	return lock ? 0 : -EINVAL;
+}
+
+/*
+ * Lock callers only see cxl_mutex_lock/unlock. Pause/backoff stay here as an
+ * internal policy choice so benchmarks and user code do not duplicate it.
+ */
 static void cxl_mutex_spin_pause(unsigned int *spins)
 {
 	(*spins)++;
@@ -699,6 +710,57 @@ static int cxl_app_free_large(struct cxl_app *app, struct cxl_extent_hdr *hdr)
 	return 0;
 }
 
+static int cxl_app_reclaim_owned_extents(struct cxl_app *app)
+{
+	size_t i;
+	int first_rc = 0;
+
+	if (!app || !app->rt)
+		return -EINVAL;
+
+	for (i = 0; i < app->nr_large_allocs; i++) {
+		struct cxl_extent_hdr *hdr = app->large_allocs[i].hdr;
+		int rc;
+
+		if (!hdr)
+			continue;
+		if (hdr->magic != CXL_APP_EXTENT_MAGIC ||
+		    hdr->kind != CXL_APP_EXTENT_LARGE_HEAD)
+			continue;
+		if (hdr->owner_machine != app->machine_id)
+			continue;
+
+		rc = cxl_macro_free(app->rt, hdr, app->timeout_ms);
+		if (rc && rc != -ENOENT && !first_rc)
+			first_rc = rc;
+		app->large_allocs[i].hdr = NULL;
+		app->large_allocs[i].user_ptr = NULL;
+	}
+	app->nr_large_allocs = 0;
+
+	for (i = 0; i < app->nr_small_extents; i++) {
+		void *base = app->small_extents[i].base;
+		struct cxl_extent_hdr *hdr = base;
+		int rc;
+
+		if (!base)
+			continue;
+		if (hdr->magic != CXL_APP_EXTENT_MAGIC ||
+		    hdr->kind != CXL_APP_EXTENT_SMALL)
+			continue;
+		if (hdr->owner_machine != app->machine_id)
+			continue;
+
+		rc = cxl_macro_free(app->rt, base, app->timeout_ms);
+		if (rc && rc != -ENOENT && !first_rc)
+			first_rc = rc;
+		app->small_extents[i].base = NULL;
+	}
+	app->nr_small_extents = 0;
+
+	return first_rc;
+}
+
 static int cxl_app_child_main(int machine_id, const struct cxl_app_cfg *cfg,
 			      uint64_t control_alloc_id, uint64_t control_size,
 			      cxl_app_main_fn_t app_main)
@@ -724,6 +786,8 @@ static int cxl_app_child_main(int machine_id, const struct cxl_app_cfg *cfg,
 	app.machine_id = machine_id;
 	app.nr_machines = cfg->nr_machines;
 	app.timeout_ms = cfg->timeout_ms;
+	app.window_base = cfg->window_base;
+	app.window_size = cfg->window_size;
 	app.rt = rt;
 	app.ctl = cxl_macro_ctl(rt);
 	pthread_mutex_init(&app.alloc_lock, NULL);
@@ -744,6 +808,11 @@ static int cxl_app_child_main(int machine_id, const struct cxl_app_cfg *cfg,
 	rc = cxl_wait_launch_go(app.ctl, cfg->timeout_ms);
 	if (!rc && app_main)
 		rc = app_main(&app);
+	if (!cxl_app_reclaim_owned_extents(&app) && rc == 0) {
+		/* nothing */
+	} else if (rc == 0) {
+		rc = 1;
+	}
 
 	pthread_mutex_destroy(&app.alloc_lock);
 	cxl_set_current_app(NULL);
@@ -823,9 +892,15 @@ int cxl_app_run(const struct cxl_app_cfg *cfg, cxl_app_main_fn_t app_main)
 			exit_code = 1;
 			break;
 		}
-		if (pid == 0)
-			_exit(cxl_app_child_main(i, &local_cfg, control_alloc_id,
-						 control_size, app_main));
+		if (pid == 0) {
+			int child_rc = cxl_app_child_main(i, &local_cfg,
+							 control_alloc_id,
+							 control_size,
+							 app_main);
+
+			fflush(NULL);
+			_exit(child_rc);
+		}
 		pids[i] = pid;
 		remaining++;
 	}
@@ -988,7 +1063,7 @@ int cxl_mutex_lock(struct cxl_mutex *lock)
 {
 	unsigned int spins = 0;
 	unsigned int delay = 4;
-	int rc = cxl_mutex_validate_live(lock);
+	int rc = cxl_mutex_fast_validate(lock);
 
 	if (rc)
 		return rc;
@@ -1009,22 +1084,19 @@ int cxl_mutex_lock(struct cxl_mutex *lock)
 
 int cxl_mutex_unlock(struct cxl_mutex *lock)
 {
-	uint32_t old_state;
-	int rc = cxl_mutex_validate_live(lock);
+	int rc = cxl_mutex_fast_validate(lock);
 
 	if (rc)
 		return rc;
 
-	old_state = atomic_exchange_explicit(&lock->state, 0, memory_order_release);
-	if (old_state == 0)
-		return -EPERM;
+	atomic_store_explicit(&lock->state, 0, memory_order_release);
 	return 0;
 }
 
 int cxl_mutex_trylock(struct cxl_mutex *lock)
 {
 	uint32_t expected = 0;
-	int rc = cxl_mutex_validate_live(lock);
+	int rc = cxl_mutex_fast_validate(lock);
 
 	if (rc)
 		return rc;
